@@ -1,0 +1,133 @@
+"""
+Modelni sinab ko'rish (backtest) — haqiqatan bukmekerdan yaxshiroqmi?
+================================================================================
+
+MANTIQ:
+  1) Ma'lumotni sana bo'yicha tartiblab, birinchi qismini (masalan 80%) FAQAT
+     o'qitish uchun ishlatamiz, oxirgi qismini (20%) ko'rmagan holda bashorat
+     qilamiz — shunday qilib "kelajakni ko'rib turib bashorat qilish" xatosidan
+     qochamiz.
+  2) Har bir test o'yini uchun modelning [uy, durang, mehmon] ehtimolliklarini
+     va (agar CSV'da bo'lsa) bukmekerning koeffitsientidan chiqarilgan
+     ehtimolliklarini solishtiramiz.
+
+METRIKALAR (aniqlik yetarli emas, chunki futbolda durang ham tez-tez bo'ladi):
+  - Log loss — past = yaxshiroq kalibrlangan ehtimollik (eng muhim metrika)
+  - Brier score — xuddi shunday, past = yaxshi
+  - Aniqlik — faqat qo'shimcha ma'lumot sifatida, asosiy xulosa uchun emas
+
+ISHLATISH:
+  python backtest_football_predictor.py <natijalar.csv> [test_ulushi] [half_life_kun]
+
+  Masalan:
+  python backtest_football_predictor.py E0.csv 0.2 400
+"""
+
+import sys
+import numpy as np
+import pandas as pd
+from football_predictor import load_data, fit_team_strengths, match_probabilities, implied_prob_from_odds
+
+ODDS_COLS = ["B365H", "B365D", "B365A"]  # football-data.co.uk'dagi eng keng tarqalgan ustunlar
+
+
+def load_odds(csv_path):
+    raw = pd.read_csv(csv_path)
+    raw = raw.rename(columns={"HomeTeam": "home", "AwayTeam": "away"})
+    raw["date"] = pd.to_datetime(raw["Date"], dayfirst=True, errors="coerce")
+    cols = [c for c in ODDS_COLS if c in raw.columns]
+    if not cols:
+        return None
+    return raw[["date", "home", "away"] + cols]
+
+
+def outcome_index(hg, ag):
+    if hg > ag:
+        return 0
+    elif hg == ag:
+        return 1
+    return 2
+
+
+def log_loss(probs, outcomes):
+    eps = 1e-12
+    return float(np.mean([-np.log(max(p[o], eps)) for p, o in zip(probs, outcomes)]))
+
+
+def brier(probs, outcomes):
+    res = []
+    for p, o in zip(probs, outcomes):
+        y = [0, 0, 0]
+        y[o] = 1
+        res.append(sum((pi - yi) ** 2 for pi, yi in zip(p, y)))
+    return float(np.mean(res))
+
+
+def accuracy(probs, outcomes):
+    return float(np.mean([int(np.argmax(p) == o) for p, o in zip(probs, outcomes)]))
+
+
+def main():
+    if len(sys.argv) < 2:
+        print("Ishlatish: python backtest_football_predictor.py <natijalar.csv> [test_ulushi] [half_life_kun]")
+        sys.exit(1)
+
+    csv_path = sys.argv[1]
+    test_fraction = float(sys.argv[2]) if len(sys.argv) > 2 else 0.2
+    half_life = float(sys.argv[3]) if len(sys.argv) > 3 else 400.0
+
+    df = load_data(csv_path).sort_values("date").reset_index(drop=True)
+    split = int(len(df) * (1 - test_fraction))
+    train, test = df.iloc[:split], df.iloc[split:]
+    print(f"Train: {len(train)} o'yin | Test (ko'rilmagan): {len(test)} o'yin")
+
+    model = fit_team_strengths(train, half_life_days=half_life)
+    odds_df = load_odds(csv_path)
+
+    model_probs, market_probs, outcomes = [], [], []
+    skipped = 0
+    for _, row in test.iterrows():
+        if row["home"] not in model["teams"] or row["away"] not in model["teams"]:
+            skipped += 1
+            continue
+        res = match_probabilities(model, row["home"], row["away"])
+        model_probs.append([res["p_home_win"], res["p_draw"], res["p_away_win"]])
+        outcomes.append(outcome_index(row["home_goals"], row["away_goals"]))
+
+        mkt = None
+        if odds_df is not None:
+            m = odds_df[(odds_df["date"] == row["date"]) & (odds_df["home"] == row["home"]) & (odds_df["away"] == row["away"])]
+            if len(m) and m.iloc[0][ODDS_COLS].notna().all():
+                o = m.iloc[0]
+                p, _ = implied_prob_from_odds(o["B365H"], o["B365D"], o["B365A"])
+                mkt = p
+        market_probs.append(mkt)
+
+    print(f"({skipped} ta o'yin o'tkazib yuborildi — train'da ko'rinmagan jamoa)\n")
+
+    print(f"=== MODEL ({len(outcomes)} o'yin) ===")
+    print(f"  Log loss = {log_loss(model_probs, outcomes):.4f}")
+    print(f"  Brier    = {brier(model_probs, outcomes):.4f}")
+    print(f"  Aniqlik  = {accuracy(model_probs, outcomes):.1%}")
+
+    paired = [(mp, mk, o) for mp, mk, o in zip(model_probs, market_probs, outcomes) if mk is not None]
+    if paired:
+        mp_l = [p[0] for p in paired]
+        mk_l = [p[1] for p in paired]
+        out_l = [p[2] for p in paired]
+        print(f"\n=== BOZOR / bukmeker ({len(paired)} o'yin, koeffitsient mavjud) ===")
+        print(f"  Log loss = {log_loss(mk_l, out_l):.4f}")
+        print(f"  Brier    = {brier(mk_l, out_l):.4f}")
+        print(f"  Aniqlik  = {accuracy(mk_l, out_l):.1%}")
+
+        diff = log_loss(mp_l, out_l) - log_loss(mk_l, out_l)
+        print(f"\n  Farq (model - bozor) log loss bo'yicha: {diff:+.4f}")
+        print("  Manfiy = model bozordan yaxshiroq kalibrlangan.")
+        print(f"  DIQQAT: {len(paired)} o'yin bilan bu hali statistik xulosa uchun kam bo'lishi mumkin —")
+        print("  futbolda tasodifiy tebranish katta, ishonchli xulosa uchun odatda 1000+ o'yin kerak.")
+    else:
+        print("\nCSV faylda bukmeker koeffitsienti topilmadi — faqat model natijasi ko'rsatildi.")
+
+
+if __name__ == "__main__":
+    main()
